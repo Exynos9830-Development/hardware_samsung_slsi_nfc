@@ -17,10 +17,16 @@
 #include "Nfc.h"
 
 #include <android-base/logging.h>
+#include <android-base/properties.h>
 
 #include "NfcExtra.h"
 #include "HalSecNfc.h"
 #include "hal.h"
+
+// HIDL passed the CORE_INIT_RSP packet into this legacy Samsung HAL
+// entry point. The AIDL shim can still use it for older blobs when
+// ro/persist.vendor.nfc.legacy_core_init_rsp is enabled.
+extern int nfc_hal_core_initialized(uint8_t* p_core_init_rsp_params);
 
 namespace aidl {
 namespace android {
@@ -28,6 +34,8 @@ namespace hardware {
 namespace nfc {
 
 std::shared_ptr<INfcClientCallback> Nfc::mCallback = nullptr;
+std::mutex Nfc::mCoreInitRspLock;
+std::vector<uint8_t> Nfc::mLastCoreInitRsp;
 AIBinder_DeathRecipient* clientDeathRecipient = nullptr;
 pthread_mutex_t mLockOpenClose = PTHREAD_MUTEX_INITIALIZER;
 
@@ -50,6 +58,12 @@ void OnDeath(void* cookie) {
         static_cast<int32_t>(NfcStatus::FAILED));
   } else {
     Nfc::mCallback = clientCallback;
+
+    {
+      std::lock_guard<std::mutex> lock(mCoreInitRspLock);
+      mLastCoreInitRsp.clear();
+    }
+    LOG(INFO) << "open: cleared cached CORE_INIT_RSP";
 
     clientDeathRecipient = AIBinder_DeathRecipient_new(OnDeath);
     auto linkRet =
@@ -82,6 +96,11 @@ void OnDeath(void* cookie) {
   } else {
     ret = nfc_hal_close();
   }
+  {
+    std::lock_guard<std::mutex> lock(mCoreInitRspLock);
+    mLastCoreInitRsp.clear();
+  }
+  LOG(INFO) << "close: cleared cached CORE_INIT_RSP";
   Nfc::mCallback = nullptr;
   AIBinder_DeathRecipient_delete(clientDeathRecipient);
   clientDeathRecipient = nullptr;
@@ -104,7 +123,32 @@ void OnDeath(void* cookie) {
         static_cast<int32_t>(NfcStatus::FAILED));
   }
 
-  int ret = nfc_hal_core_initialized_for_aidl();
+  std::vector<uint8_t> coreInitRsp;
+  {
+    std::lock_guard<std::mutex> lock(mCoreInitRspLock);
+    coreInitRsp = mLastCoreInitRsp;
+  }
+
+  const bool legacyCoreInitRsp =
+      ::android::base::GetBoolProperty("persist.vendor.nfc.legacy_core_init_rsp",
+                                       ::android::base::GetBoolProperty(
+                                           "ro.vendor.nfc.legacy_core_init_rsp",
+                                           false));
+  LOG(INFO) << "coreInitialized: legacy_core_init_rsp=" << legacyCoreInitRsp
+            << " cached_len=" << coreInitRsp.size();
+
+  int ret;
+  if (legacyCoreInitRsp && !coreInitRsp.empty()) {
+    LOG(INFO) << "coreInitialized: forwarding cached CORE_INIT_RSP len="
+              << coreInitRsp.size();
+    ret = nfc_hal_core_initialized(coreInitRsp.data());
+  } else {
+    if (legacyCoreInitRsp) {
+      LOG(WARNING) << "coreInitialized: legacy CORE_INIT_RSP enabled, "
+                   << "but no cached CORE_INIT_RSP is available; falling back";
+    }
+    ret = nfc_hal_core_initialized_for_aidl();
+  }
   if(ret == 0)
     LOG(INFO) << "coreInitialized: ret = 0, so call ok()";
   else

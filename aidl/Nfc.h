@@ -20,6 +20,10 @@
 #include <aidl/android/hardware/nfc/INfcClientCallback.h>
 #include <android-base/logging.h>
 
+#include <cstdint>
+#include <mutex>
+#include <vector>
+
 #include "hardware_nfc.h"
 
 namespace aidl {
@@ -103,6 +107,32 @@ struct Nfc : public BnNfc {
   }
 
   static void dataCallback(uint16_t data_len, uint8_t* p_data) {
+    if (p_data == nullptr || data_len == 0) {
+      LOG(WARNING) << "dataCallback: empty/null NCI packet";
+      return;
+    }
+
+    if (data_len >= 3) {
+      const uint8_t mt = p_data[0] & 0xE0;
+      const uint8_t gid = p_data[0] & 0x0F;
+      const uint8_t oid = p_data[1] & 0x3F;
+      const uint8_t payload_len = p_data[2];
+
+      // CORE_INIT_RSP: MT=RSP(0x40), GID=CORE(0x00), OID=INIT(0x01).
+      // Samsung's legacy nfc_hal_core_initialized() expects the full NCI
+      // packet, not only the payload; it reads byte 2 as the payload length.
+      if (mt == 0x40 && gid == 0x00 && oid == 0x01) {
+        if (data_len >= static_cast<uint16_t>(payload_len) + 3) {
+          std::lock_guard<std::mutex> lock(mCoreInitRspLock);
+          mLastCoreInitRsp.assign(p_data, p_data + data_len);
+          LOG(INFO) << "Cached CORE_INIT_RSP len=" << data_len;
+        } else {
+          LOG(WARNING) << "Short CORE_INIT_RSP len=" << data_len
+                       << " payload_len=" << static_cast<int>(payload_len);
+        }
+      }
+    }
+
     std::vector<uint8_t> data(p_data, p_data + data_len);
     if (mCallback != nullptr) {
       auto ret = mCallback->sendData(data);
@@ -113,6 +143,8 @@ struct Nfc : public BnNfc {
   }
 
   static std::shared_ptr<INfcClientCallback> mCallback;
+  static std::mutex mCoreInitRspLock;
+  static std::vector<uint8_t> mLastCoreInitRsp;
 };
 
 }  // namespace nfc
